@@ -1,0 +1,300 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Note that some adapters may set a maximum length for the String type by default, please ensure your strings are long
+// enough when changing adapters.
+// See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
+datasource db {
+  provider = "sqlite"
+  url      = "file:dev.sqlite"
+}
+
+model Session {
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}
+
+// One row per installed shop. Sessions come and go (offline/online, token
+// refresh) but app-level settings (billing status, onboarding) live here
+// keyed by the stable shop domain.
+model Shop {
+  id        String   @id @default(cuid())
+  domain    String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  planName             String? // Shopify Billing API plan, set in Phase 6
+  planActivatedAt      DateTime?
+  onboardingCompletedAt DateTime?
+
+  optionSets OptionSet[]
+}
+
+enum OptionSetStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+enum OptionSetScope {
+  ALL_PRODUCTS
+  SPECIFIC_PRODUCTS
+  SPECIFIC_COLLECTIONS
+}
+
+// A named group of custom option fields (+ optional bundle + rules) that
+// merchants assign to products/collections/the whole store.
+model OptionSet {
+  id        String          @id @default(cuid())
+  shopId    String
+  shop      Shop            @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  title     String
+  status    OptionSetStatus @default(DRAFT)
+  scope     OptionSetScope  @default(SPECIFIC_PRODUCTS)
+  position  Int             @default(0)
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+
+  // Quantity stepper settings (Phase 2). Simple multiplier mode only (v1):
+  // all units added in one add-to-cart action share the same selections.
+  quantityEnabled Boolean @default(false)
+  quantityMin     Int     @default(1)
+  quantityMax     Int     @default(10)
+  quantityDefault Int     @default(1)
+  quantityStep    Int     @default(1)
+
+  fields      OptionField[]
+  rules       Rule[]
+  bundles     Bundle[]
+  products    OptionSetProduct[]
+  collections OptionSetCollection[]
+
+  @@index([shopId])
+}
+
+// Join table: OptionSet <-> Shopify Product (by GID), used when scope is
+// SPECIFIC_PRODUCTS. Product/collection data itself lives in Shopify, not
+// mirrored here — we only store the GID reference.
+model OptionSetProduct {
+  id            String    @id @default(cuid())
+  optionSetId   String
+  optionSet     OptionSet @relation(fields: [optionSetId], references: [id], onDelete: Cascade)
+  productGid    String // e.g. "gid://shopify/Product/123456789"
+
+  @@unique([optionSetId, productGid])
+  @@index([productGid])
+}
+
+// Join table: OptionSet <-> Shopify Collection (by GID), used when scope is
+// SPECIFIC_COLLECTIONS.
+model OptionSetCollection {
+  id            String    @id @default(cuid())
+  optionSetId   String
+  optionSet     OptionSet @relation(fields: [optionSetId], references: [id], onDelete: Cascade)
+  collectionGid String // e.g. "gid://shopify/Collection/123456789"
+
+  @@unique([optionSetId, collectionGid])
+  @@index([collectionGid])
+}
+
+enum OptionFieldType {
+  TEXT
+  NUMBER
+  DROPDOWN
+  CHECKBOX
+  RADIO
+  SWATCH
+  DATE
+}
+
+// A single customization input within an Option Set (e.g. "Engraving Text",
+// "Gift Wrap", "Color"). Choice-bearing types (DROPDOWN/CHECKBOX/RADIO/
+// SWATCH) have OptionChoice rows; TEXT/NUMBER/DATE don't.
+model OptionField {
+  id          String          @id @default(cuid())
+  optionSetId String
+  optionSet   OptionSet       @relation(fields: [optionSetId], references: [id], onDelete: Cascade)
+  type        OptionFieldType
+  label       String
+  helpText    String?
+  required    Boolean         @default(false)
+  position    Int             @default(0)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  // TEXT: max character length. NUMBER: min/max/step bounds. DATE: min/max
+  // selectable date (ISO strings). Kept as loosely-typed JSON string so we
+  // don't need a differently-shaped table per field type; parsed/validated
+  // in application code against a Zod schema keyed by `type`.
+  settingsJson String @default("{}")
+
+  choices           OptionChoice[]
+  conditionsAsField RuleCondition[] @relation("ConditionField")
+  effectsAsTarget   RuleEffect[]    @relation("EffectTargetField")
+
+  @@index([optionSetId])
+}
+
+// A selectable value for DROPDOWN/CHECKBOX/RADIO/SWATCH fields, with its own
+// price delta (added to base price when selected).
+model OptionChoice {
+  id            String      @id @default(cuid())
+  optionFieldId String
+  optionField   OptionField @relation(fields: [optionFieldId], references: [id], onDelete: Cascade)
+  label         String
+  value         String // stable machine value, referenced by RuleCondition/RuleEffect
+  priceDelta    Int         @default(0) // cents, added to base price when this choice is selected
+  position      Int         @default(0)
+
+  // SWATCH only: hex color or image URL. Ignored for other field types.
+  swatchColor String?
+  swatchImage String?
+
+  conditionsAsChoice RuleCondition[] @relation("ConditionChoice")
+  effectsAsChoice     RuleEffect[]   @relation("EffectTargetChoice")
+
+  @@index([optionFieldId])
+}
+
+enum RuleLogicType {
+  AND
+  OR
+}
+
+// A conditional rule: one or more RuleConditions (combined with AND/OR)
+// gate one or more RuleEffects. Evaluated by the pure rule engine
+// (Phase 3) identically in the admin preview and storefront.
+model Rule {
+  id          String        @id @default(cuid())
+  optionSetId String
+  optionSet   OptionSet     @relation(fields: [optionSetId], references: [id], onDelete: Cascade)
+  name        String
+  logicType   RuleLogicType @default(AND)
+  enabled     Boolean       @default(true)
+  position    Int           @default(0)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  conditions RuleCondition[]
+  effects    RuleEffect[]
+
+  @@index([optionSetId])
+}
+
+enum RuleOperator {
+  EQUALS
+  NOT_EQUALS
+  CONTAINS
+  GREATER_THAN
+  LESS_THAN
+  IS_EMPTY
+  IS_NOT_EMPTY
+}
+
+// One condition within a Rule, e.g. "Engraving Text is not empty" or
+// "Color equals Red". `fieldId` is always set; `choiceId` is set when the
+// condition targets a specific choice value (dropdown/radio/swatch/checkbox).
+model RuleCondition {
+  id       String       @id @default(cuid())
+  ruleId   String
+  rule     Rule         @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  fieldId  String
+  field    OptionField  @relation("ConditionField", fields: [fieldId], references: [id], onDelete: Cascade)
+  choiceId String?
+  choice   OptionChoice? @relation("ConditionChoice", fields: [choiceId], references: [id], onDelete: Cascade)
+  operator RuleOperator
+  value    String? // free-form comparison value for TEXT/NUMBER/DATE conditions
+  position Int          @default(0)
+
+  @@index([ruleId])
+  @@index([fieldId])
+}
+
+enum RuleEffectType {
+  SHOW_FIELD
+  HIDE_FIELD
+  PRICE_DELTA
+  SELECT_BUNDLE_ITEM
+}
+
+// One effect produced when a Rule's conditions are satisfied. Which
+// relation is populated depends on `type`:
+// SHOW_FIELD/HIDE_FIELD -> targetFieldId; PRICE_DELTA -> value (cents);
+// SELECT_BUNDLE_ITEM -> targetBundleItemId.
+model RuleEffect {
+  id                String         @id @default(cuid())
+  ruleId            String
+  rule              Rule           @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  type              RuleEffectType
+  targetFieldId     String?
+  targetField       OptionField?   @relation("EffectTargetField", fields: [targetFieldId], references: [id], onDelete: Cascade)
+  targetChoiceId    String?
+  targetChoice      OptionChoice?  @relation("EffectTargetChoice", fields: [targetChoiceId], references: [id], onDelete: Cascade)
+  targetBundleItemId String?
+  targetBundleItem  BundleItem?    @relation(fields: [targetBundleItemId], references: [id], onDelete: Cascade)
+  value             String? // e.g. price delta in cents, as a string for type uniformity
+  position          Int            @default(0)
+
+  @@index([ruleId])
+}
+
+// A dynamically-priced add-on bundle attached to an Option Set (e.g. "Gift
+// Set Add-ons"). Distinct from OptionField/OptionChoice because bundle
+// items reference real Shopify product variants (for inventory/fulfillment)
+// rather than being purely descriptive choices.
+model Bundle {
+  id          String   @id @default(cuid())
+  optionSetId String
+  optionSet   OptionSet @relation(fields: [optionSetId], references: [id], onDelete: Cascade)
+  name        String
+  position    Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  items BundleItem[]
+
+  @@index([optionSetId])
+}
+
+// One item within a Bundle, linked to a real Shopify product variant.
+// `basePrice` is the flat price delta when this item is included;
+// `conditionalPriceRulesJson` holds an ordered list of
+// { ruleId, priceDelta } overrides applied on top of basePrice when the
+// referenced Rule's conditions are met (evaluated by the same rule engine).
+// Kept as JSON rather than a table because these overrides are small,
+// always read/written as a whole set, and their shape may evolve in
+// Phase 3 as the rule engine's effect model is finalized.
+model BundleItem {
+  id                        String  @id @default(cuid())
+  bundleId                  String
+  bundle                    Bundle  @relation(fields: [bundleId], references: [id], onDelete: Cascade)
+  productVariantGid         String // e.g. "gid://shopify/ProductVariant/123456789"
+  title                     String
+  basePrice                 Int     @default(0) // cents
+  conditionalPriceRulesJson String  @default("[]")
+  position                  Int     @default(0)
+
+  selectedByEffects RuleEffect[]
+
+  @@index([bundleId])
+  @@index([productVariantGid])
+}
